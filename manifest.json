@@ -1,0 +1,68 @@
+{
+  "name": "gopeed-extension-pikpak",
+  "author": "TeamBreakerr",
+  "title": "PikPak 分享下载",
+  "description": "解析 mypikpak.com 分享链接，无需登录即可下载（基于 Web 端公开签名算法）",
+  "icon": "",
+  "version": "1.0.0",
+  "homepage": "https://github.com/TeamBreakerr/gopeed-extension-pikpak",
+  "repository": {
+    "url": "https://github.com/TeamBreakerr/gopeed-extension-pikpak"
+  },
+  "scripts": [
+    {
+      "event": "onResolve",
+      "match": {
+        "urls": [
+          "*://mypikpak.com/s/*",
+          "*://*.mypikpak.com/s/*",
+          "*://mypikpak.net/s/*",
+          "*://*.mypikpak.net/s/*"
+        ]
+      },
+      "entry": "index.js"
+    }
+  ],
+  "settings": [
+    {
+      "name": "api_host",
+      "title": "API 域名",
+      "description": "默认 .com（多数代理规则集只覆盖 mypikpak.com，命中率更高）",
+      "type": "string",
+      "value": "api-drive.mypikpak.com",
+      "options": [
+        { "label": "api-drive.mypikpak.com", "value": "api-drive.mypikpak.com" },
+        { "label": "api-drive.mypikpak.net", "value": "api-drive.mypikpak.net" }
+      ]
+    },
+    {
+      "name": "user_host",
+      "title": "Captcha 域名",
+      "description": "用于 captcha/init 的 user 域名",
+      "type": "string",
+      "value": "user.mypikpak.com",
+      "options": [
+        { "label": "user.mypikpak.com", "value": "user.mypikpak.com" },
+        { "label": "user.mypikpak.net", "value": "user.mypikpak.net" }
+      ]
+    },
+    {
+      "name": "use_transcoding",
+      "title": "使用转码地址",
+      "description": "对视频文件优先使用转码地址（清晰度较低但更稳定），否则使用原始下载链接",
+      "type": "string",
+      "value": "0",
+      "options": [
+        { "label": "关闭（原始链接）", "value": "0" },
+        { "label": "开启（转码链接）", "value": "1" }
+      ]
+    },
+    {
+      "name": "share_pwd",
+      "title": "分享密码",
+      "description": "分享需要密码时填写，否则留空",
+      "type": "string",
+      "value": ""
+    }
+  ]
+}
