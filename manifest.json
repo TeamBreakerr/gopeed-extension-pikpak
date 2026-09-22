@@ -4,7 +4,7 @@
   "title": "PikPak 分享下载",
   "description": "解析 mypikpak.com 分享链接，无需登录即可下载（基于 Web 端公开签名算法）",
   "icon": "",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "homepage": "https://github.com/TeamBreakerr/gopeed-extension-pikpak",
   "repository": {
     "url": "https://github.com/TeamBreakerr/gopeed-extension-pikpak"
@@ -21,6 +21,15 @@
         ]
       },
       "entry": "index.js"
+    },
+    {
+      "event": "onStart",
+      "match": {
+        "labels": [
+          "pikpak-share-file"
+        ]
+      },
+      "entry": "index.js"
     }
   ],
   "settings": [
@@ -31,8 +40,14 @@
       "type": "string",
       "value": "api-drive.mypikpak.com",
       "options": [
-        { "label": "api-drive.mypikpak.com", "value": "api-drive.mypikpak.com" },
-        { "label": "api-drive.mypikpak.net", "value": "api-drive.mypikpak.net" }
+        {
+          "label": "api-drive.mypikpak.com",
+          "value": "api-drive.mypikpak.com"
+        },
+        {
+          "label": "api-drive.mypikpak.net",
+          "value": "api-drive.mypikpak.net"
+        }
       ]
     },
     {
@@ -42,8 +57,14 @@
       "type": "string",
       "value": "user.mypikpak.com",
       "options": [
-        { "label": "user.mypikpak.com", "value": "user.mypikpak.com" },
-        { "label": "user.mypikpak.net", "value": "user.mypikpak.net" }
+        {
+          "label": "user.mypikpak.com",
+          "value": "user.mypikpak.com"
+        },
+        {
+          "label": "user.mypikpak.net",
+          "value": "user.mypikpak.net"
+        }
       ]
     },
     {
@@ -53,8 +74,14 @@
       "type": "string",
       "value": "0",
       "options": [
-        { "label": "关闭（原始链接）", "value": "0" },
-        { "label": "开启（转码链接）", "value": "1" }
+        {
+          "label": "关闭（原始链接）",
+          "value": "0"
+        },
+        {
+          "label": "开启（转码链接）",
+          "value": "1"
+        }
       ]
     },
     {

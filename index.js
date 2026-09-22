@@ -529,58 +529,69 @@ gopeed.events.onResolve(function (ctx) {
         throw new Error("分享内未找到任何可下载的文件");
       }
       gopeed.logger.info("[pikpak] flat files:", files.length);
-      // 2) 逐个解析下载链
-      var resolved = [];
-      return files
-        .reduce(function (p, item, index) {
-          return p.then(function () {
-            return client.getFileInfo(parsed.shareId, item.id).then(function (info) {
-              var fi = info.file_info || info;
-              var url = pickDownloadUrl(fi, client.useTrans);
-              if (!url) {
-                throw new Error("文件 " + (index + 1) + "/" + files.length + " 没有可用下载地址");
-              }
-              resolved.push({
-                name: item.name,
-                path: item.path || "",
-                size: item.size,
-                req: {
-                  url: url,
-                  extra: {
-                    header: {
-                      "User-Agent": DEFAULT_UA,
-                      Referer: "https://mypikpak.com/",
-                    },
-                  },
-                },
-              });
-              if (resolved.length % 10 === 0 || resolved.length === files.length) {
-                gopeed.logger.info("[pikpak] progress " + resolved.length + "/" + files.length);
-              }
-            }).catch(function (err) {
-              throw new Error("文件 " + (index + 1) + "/" + files.length + "：" + err.message);
-            });
-          });
-        }, Promise.resolve())
-        .then(function () {
-          ctx.res = {
-            name: "",
-            files: resolved,
+      // Return metadata before the desktop UI's 60-second receive timeout.
+      // Resolve only selected files when each download actually starts.
+      ctx.res = {
+        name: files.length > 1 ? "PikPak-" + parsed.shareId.slice(-10) : "",
+        files: files.map(function (item) {
+          return {
+            name: item.name,
+            path: item.path || "",
+            size: item.size,
+            req: {
+              url: PENDING_URL,
+              labels: {
+                "pikpak-share-file": "1",
+                "pikpak-share-id": parsed.shareId,
+                "pikpak-file-id": item.id,
+              },
+            },
           };
-          if (resolved.length > 1) {
-            // 多文件时给出一个目录名（取分享 ID 末尾若干）
-            ctx.res.name = "PikPak-" + parsed.shareId.slice(-10);
-          }
-          gopeed.logger.info(
-            "[pikpak] resolved",
-            resolved.length,
-            "files"
-          );
-        });
+        }),
+      };
+      gopeed.logger.info("[pikpak] listed " + files.length + " files; download URLs deferred until start");
     }).catch(function (err) {
       var message = "PikPak 解析失败：" + err.message;
       gopeed.logger.error("[pikpak] " + message);
       // Gopeed propagates MessageError to the UI; ordinary Errors fall back to HTTP.
       throw new MessageError(message);
     });
+});
+
+// A reserved, nonresolving domain prevents an unresolved task downloading HTML.
+var PENDING_URL = "https://pikpak-pending.invalid/file";
+
+gopeed.events.onStart(function (ctx) {
+  var req = ctx.task.meta.req;
+  var labels = req.labels || {};
+  if (labels["pikpak-share-file"] !== "1") return;
+  // Also invalidate old signed URLs on resume, before any network request.
+  // Gopeed 1.9.3 logs onStart errors but continues: fail closed if resolution fails.
+  req.url = PENDING_URL;
+  var client = new PikPakClient(gopeed.settings || {});
+  var shareId = labels["pikpak-share-id"];
+  var fileId = labels["pikpak-file-id"];
+  return Promise.resolve().then(function () {
+    if (!shareId || !fileId) throw new Error("缺少分享或文件标识，请重新创建任务");
+    if (client.sharePwd) {
+      return client.getShareInfo(shareId, client.sharePwd).then(function (info) {
+        client.passCodeToken = info.pass_code_token || "";
+      });
+    }
+  }).then(function () {
+    return client.getFileInfo(shareId, fileId);
+  }).then(function (info) {
+    var url = pickDownloadUrl(info.file_info || info, client.useTrans);
+    if (!url || !/^https?:\/\//i.test(url)) throw new Error("文件没有可用下载地址");
+    req.extra = req.extra || {};
+    req.extra.header = req.extra.header || {};
+    req.extra.header["User-Agent"] = DEFAULT_UA;
+    req.extra.header.Referer = "https://mypikpak.com/";
+    req.url = url;
+    gopeed.logger.info("[pikpak] download URL ready");
+  }).catch(function (err) {
+    var message = "PikPak 下载地址解析失败：" + err.message;
+    gopeed.logger.error("[pikpak] " + message);
+    throw new MessageError(message);
+  });
 });
