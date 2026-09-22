@@ -4,7 +4,7 @@
   "title": "PikPak 分享下载",
   "description": "解析 mypikpak.com 分享链接，无需登录即可下载（基于 Web 端公开签名算法）",
   "icon": "",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "homepage": "https://github.com/TeamBreakerr/gopeed-extension-pikpak",
   "repository": {
     "url": "https://github.com/TeamBreakerr/gopeed-extension-pikpak"

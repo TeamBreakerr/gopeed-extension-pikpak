@@ -51,6 +51,23 @@ PikPak 对 IDC IP 段（DigitalOcean/AWS/各类云厂商）有屏蔽。如果直
 
 ## 实现原理
 
+### 大型分享与网络错误（1.0.1）
+
+解析时先递归列出文件，再串行获取每个文件的下载地址；大量文件可能需要数分钟。
+网络错误、30 秒请求超时、HTTP 408/429/5xx 会自动重试，每个请求最多尝试 5 次，
+重试间隔为 1、2、4、8 秒。服务器的 `Retry-After` 会被遵守；超过 60 秒则提示稍后再试。
+密码错误、其他 HTTP 错误等不会盲目重试。
+
+每完成 10 个文件，扩展日志会输出 `[pikpak] progress 已完成数/总数`。
+重试日志只记录接口地址（不含查询参数）、状态与等待时间，不记录密码、令牌或下载直链。
+Gopeed 的日志目录中可找到 `extension.log`；部分 Windows 安装位于安装目录的 `storage/logs`。
+
+只有全部文件解析完成才返回文件列表。重试耗尽或缺少下载地址时，通过 Gopeed 的
+`MessageError` 显示具体失败阶段/文件序号，避免静默回退成“分享 ID、未知大小”的普通 HTTP 文件。
+此修复可缓解短暂连接故障，但不能绕过持续的网络阻断或分享访问限制。
+
+开发验证：`node --test tests/resolve.test.cjs`（测试不访问网络）。
+
 参考 [alist 的 pikpak_share 驱动](https://github.com/alist-org/alist/tree/main/drivers/pikpak_share)，移植成纯 JS 在 Gopeed 的 goja 运行时里跑：
 
 ```
