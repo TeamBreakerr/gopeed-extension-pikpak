@@ -51,6 +51,30 @@ PikPak 对 IDC IP 段（DigitalOcean/AWS/各类云厂商）有屏蔽。如果直
 
 ## 实现原理
 
+### 大型分享与网络错误（1.0.2）
+
+新建任务时只读取目录、文件名和大小，不再提前获取全部文件的下载地址。
+Gopeed 1.9.3 桌面界面的接收超时为 60 秒；旧版在文件选择前请求数百次直链容易超时。
+选中文件并开始下载后，通过 `onStart` 为每个选中的文件获取直链；恢复下载时重新获取，避免复用过期地址。
+新建任务时不要勾选“直接下载”，否则会绕过扩展的文件选择解析。
+
+网络错误、30 秒请求超时、HTTP 408/429/5xx 会自动重试，每个请求最多尝试 5 次，
+重试间隔为 1、2、4、8 秒。服务器的 `Retry-After` 会被遵守；超过 60 秒则提示稍后再试。
+密码错误、其他 HTTP 错误等不会盲目重试。
+
+特别大的目录或持续网络故障仍可能使目录列举超过界面等待时间。
+日志中的 `[pikpak] listed N files` 表示文件选择列表已就绪；`download URL ready` 表示一个下载任务已取得地址。
+重试日志只记录接口地址（不含查询参数）、状态与等待时间，不记录密码、令牌或下载直链。
+Gopeed 的日志目录中可找到 `extension.log`；部分 Windows 安装位于安装目录的 `storage/logs`。
+
+只有完整列举成功才返回文件列表，列举失败通过 `MessageError` 明确报告。
+下载地址解析失败时记录错误，并保留不可下载的 `.invalid` 占位地址，
+避免误下载分享网页或复用旧地址；请查看扩展日志后重试任务。
+文件列表中的大小来自原文件元数据，转码模式下实际下载大小可能不同。
+此修复可缓解短暂连接故障，但不能绕过持续的网络阻断或分享访问限制。
+
+开发验证：`node --test tests/resolve.test.cjs`（测试不访问网络）。
+
 参考 [alist 的 pikpak_share 驱动](https://github.com/alist-org/alist/tree/main/drivers/pikpak_share)，移植成纯 JS 在 Gopeed 的 goja 运行时里跑：
 
 ```
@@ -65,11 +89,13 @@ share/detail  (GET api-drive.mypikpak.com)
   query: { share_id, parent_id, pass_code_token, page_token, ... }
        │  → 递归子目录 + 翻页
        ▼
-share/file_info (GET api-drive.mypikpak.com)
-  query: { share_id, file_id, pass_code_token }
-       │  → web_content_link
+ctx.res = { name, files: [{ name, path, size, req: { url: 占位地址, labels: 文件标识 } }] }
+       │  → 用户选择文件，创建下载任务
        ▼
-ctx.res = { name, files: [{ name, path, size, req: { url, extra.header } }] }
+onStart → captcha/init → share/file_info
+       │  → 仅获取当前任务的直链
+       ▼
+ctx.task.meta.req.url = 下载地址
 ```
 
 ## License
