@@ -4,3 +4,4 @@ dist/
 *.log
 .idea/
 .vscode/
+test/.storage*.json

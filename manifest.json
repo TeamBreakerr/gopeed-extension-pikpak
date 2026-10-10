@@ -2,9 +2,9 @@
   "name": "gopeed-extension-pikpak",
   "author": "TeamBreakerr",
   "title": "PikPak 分享下载",
-  "description": "解析 mypikpak.com 分享链接，无需登录即可下载（基于 Web 端公开签名算法）",
+  "description": "解析 mypikpak.com 分享链接：视频可匿名下载，zip 等其他文件需填写 PikPak 账号或 refresh_token",
   "icon": "",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "homepage": "https://github.com/TeamBreakerr/gopeed-extension-pikpak",
   "repository": {
     "url": "https://github.com/TeamBreakerr/gopeed-extension-pikpak"
@@ -61,6 +61,27 @@
       "name": "share_pwd",
       "title": "分享密码",
       "description": "分享需要密码时填写，否则留空",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "name": "username",
+      "title": "PikPak 账号",
+      "description": "邮箱/手机号/用户名。匿名只能下载视频，zip 等其他文件需要登录",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "name": "password",
+      "title": "PikPak 密码",
+      "description": "与账号配合使用；登录态会缓存，过期自动刷新",
+      "type": "string",
+      "value": ""
+    },
+    {
+      "name": "refresh_token",
+      "title": "refresh_token（可选）",
+      "description": "账号密码登录被要求人机验证时，改填网页端的 refresh_token（见 README）",
       "type": "string",
       "value": ""
     }

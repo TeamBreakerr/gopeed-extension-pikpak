@@ -1,8 +1,11 @@
 /**
  * Gopeed 扩展：PikPak 分享下载
  *
- * 解析 https://mypikpak.com/s/{share_id}[/{pass_code_token}] 形式的分享链接，
- * 无需账号；签名算法和 API 流程参考 Alist 的 pikpak_share 驱动。
+ * 解析 https://mypikpak.com/s/{share_id}[/{parent_id}] 形式的分享链接；
+ * 签名算法和 API 流程参考 Alist/OpenList 的 pikpak / pikpak_share 驱动。
+ *
+ * 匿名访问时 PikPak 只给视频返回播放链接（medias），web_content_link 恒为空，
+ * 所以 zip 等非视频文件必须登录（账号密码或 refresh_token）后才能拿到下载地址。
  */
 
 // ====== 常量：Web 端签名算法 ======
@@ -178,6 +181,23 @@ function genDeviceId() {
   return s;
 }
 
+// gopeed.storage 是按扩展隔离的持久化 KV（值为字符串），用来跨解析保存登录态
+function storageGet(key) {
+  try {
+    var v = gopeed.storage ? gopeed.storage.get(key) : null;
+    return v === null || v === undefined ? "" : String(v);
+  } catch (e) {
+    return "";
+  }
+}
+function storageSet(key, value) {
+  try {
+    if (gopeed.storage) gopeed.storage.set(key, value ? String(value) : "");
+  } catch (e) {
+    // 存储不可用时退化为单次会话
+  }
+}
+
 function captchaSign(deviceId, ts) {
   var s = WEB_CLIENT_ID + WEB_CLIENT_VERSION + WEB_PACKAGE_NAME + deviceId + ts;
   for (var i = 0; i < WEB_ALGORITHMS.length; i++) {
@@ -241,41 +261,69 @@ function PikPakClient(settings) {
   this.userHost = (settings && settings.user_host) || "user.mypikpak.net";
   this.useTrans = settings && settings.use_transcoding === "1";
   this.sharePwd = (settings && settings.share_pwd) || "";
-  this.deviceId = genDeviceId();
+  this.username = String((settings && settings.username) || "").trim();
+  this.password = String((settings && settings.password) || "");
+  // 从浏览器控制台复制时常带上两侧引号
+  this.refreshTokenSetting = String((settings && settings.refresh_token) || "")
+    .trim()
+    .replace(/^['"]+|['"]+$/g, "");
+  // 登录态和设备绑定，设备 ID 必须持久化，否则每次都像新设备登录、容易触发验证
+  this.deviceId = storageGet("device_id");
+  if (!this.deviceId) {
+    this.deviceId = genDeviceId();
+    storageSet("device_id", this.deviceId);
+  }
   this.captchaToken = "";
   this.passCodeToken = "";
+  this.accessToken = "";
+  this.refreshToken = "";
+  this.userId = "";
 }
 
 PikPakClient.prototype._headers = function () {
-  return {
+  var h = {
     "User-Agent": DEFAULT_UA,
     "Content-Type": "application/json",
     "X-Client-ID": WEB_CLIENT_ID,
     "X-Device-ID": this.deviceId,
     "X-Captcha-Token": this.captchaToken || "",
   };
+  if (this.accessToken) {
+    h.Authorization = "Bearer " + this.accessToken;
+  }
+  return h;
 };
 
-PikPakClient.prototype.refreshCaptcha = function (action) {
+// extraMeta：登录前用 {email|phone_number|username}，登录后默认带 user_id
+PikPakClient.prototype.refreshCaptcha = function (action, extraMeta) {
   var ts = String(new Date().getTime());
   var sign = captchaSign(this.deviceId, ts);
+  var meta = {
+    captcha_sign: sign,
+    client_version: WEB_CLIENT_VERSION,
+    package_name: WEB_PACKAGE_NAME,
+    timestamp: ts,
+  };
+  if (extraMeta) {
+    for (var k in extraMeta) meta[k] = extraMeta[k];
+  } else {
+    meta.user_id = this.userId || "";
+  }
   var body = {
     action: action,
     captcha_token: this.captchaToken || "",
     client_id: WEB_CLIENT_ID,
     device_id: this.deviceId,
-    meta: {
-      captcha_sign: sign,
-      client_version: WEB_CLIENT_VERSION,
-      package_name: WEB_PACKAGE_NAME,
-      timestamp: ts,
-      user_id: "",
-    },
-    redirect_uri: "",
+    meta: meta,
+    redirect_uri: "xlaccsdk01://xbase.cloud/callback?state=harbor",
   };
   var self = this;
   return httpJson({
-    url: "https://" + this.userHost + "/v1/shield/captcha/init",
+    url:
+      "https://" +
+      this.userHost +
+      "/v1/shield/captcha/init?client_id=" +
+      WEB_CLIENT_ID,
     method: "POST",
     headers: this._headers(),
     body: JSON.stringify(body),
@@ -289,41 +337,216 @@ PikPakClient.prototype.refreshCaptcha = function (action) {
       );
     }
     self.captchaToken = r.data.captcha_token;
-    return r.data.captcha_token;
+    return r.data;
   });
 };
 
-// 自动带 captcha 重试一次
-PikPakClient.prototype._request = function (path, method, query) {
+// ====== 登录态：账号密码 / refresh_token，token 存在 gopeed.storage 里复用 ======
+PikPakClient.prototype.hasCredentials = function () {
+  return !!(this.refreshTokenSetting || (this.username && this.password));
+};
+
+// Web 端是公开客户端：带浏览器 UA 时不能传 client_secret，否则报 error_code 7
+PikPakClient.prototype._authPost = function (path, body) {
+  return httpJson({
+    url: "https://" + this.userHost + path + "?client_id=" + WEB_CLIENT_ID,
+    method: "POST",
+    headers: {
+      "User-Agent": DEFAULT_UA,
+      "Content-Type": "application/json",
+      "X-Client-ID": WEB_CLIENT_ID,
+      "X-Device-ID": this.deviceId,
+    },
+    body: JSON.stringify(body),
+  });
+};
+
+PikPakClient.prototype._saveToken = function (data) {
+  var expiresIn = parseInt(data.expires_in, 10) || 7200;
+  this.accessToken = data.access_token;
+  this.refreshToken = data.refresh_token;
+  this.userId = data.sub || "";
+  // 匿名阶段拿的 captcha_token 不带 user_id，登录后重新取
+  this.captchaToken = "";
+  storageSet("access_token", this.accessToken);
+  storageSet("refresh_token", this.refreshToken);
+  storageSet("user_id", this.userId);
+  // 提前 5 分钟视为过期
+  storageSet("expires_at", new Date().getTime() + (expiresIn - 300) * 1000);
+  storageSet("account", this.username);
+};
+
+PikPakClient.prototype._clearToken = function () {
+  this.accessToken = "";
+  this.refreshToken = "";
+  this.userId = "";
+  storageSet("access_token", "");
+  storageSet("refresh_token", "");
+  storageSet("user_id", "");
+  storageSet("expires_at", "");
+};
+
+function authErrorText(r) {
+  if (r.data && (r.data.error_description || r.data.error)) {
+    return (
+      (r.data.error_code ? r.data.error_code + " " : "") +
+      (r.data.error_description || r.data.error)
+    );
+  }
+  return r.status + " " + r.text;
+}
+
+PikPakClient.prototype.signin = function () {
+  var self = this;
+  if (!this.username || !this.password) {
+    return Promise.reject(
+      new Error(
+        "refresh_token 已失效，请在扩展设置中重新填写 refresh_token，或填写账号密码"
+      )
+    );
+  }
+  var meta = {};
+  if (/\w+([-+.]\w+)*@\w+([-.]\w+)*\.\w+([-.]\w+)*/.test(this.username)) {
+    meta.email = this.username;
+  } else if (this.username.length >= 11 && this.username.length <= 18) {
+    meta.phone_number = this.username;
+  } else {
+    meta.username = this.username;
+  }
+  this._clearToken();
+  this.captchaToken = "";
+  return this.refreshCaptcha("POST:/v1/auth/signin", meta)
+    .then(function (captcha) {
+      if (captcha.url) {
+        // 需要滑块等人机验证，扩展里没法完成
+        throw new Error(
+          "登录要求人机验证，请改用 refresh_token（见扩展 README）"
+        );
+      }
+      return self._authPost("/v1/auth/signin", {
+        captcha_token: self.captchaToken,
+        client_id: WEB_CLIENT_ID,
+        username: self.username,
+        password: self.password,
+      });
+    })
+    .then(function (r) {
+      if (!r.data || !r.data.access_token || !r.data.refresh_token) {
+        throw new Error("登录失败：" + authErrorText(r));
+      }
+      self._saveToken(r.data);
+      gopeed.logger.info("[pikpak] signed in, user_id=" + self.userId);
+    });
+};
+
+PikPakClient.prototype.refreshAccessToken = function () {
+  var self = this;
+  return this._authPost("/v1/auth/token", {
+    client_id: WEB_CLIENT_ID,
+    grant_type: "refresh_token",
+    refresh_token: this.refreshToken,
+  }).then(function (r) {
+    if (r.data && r.data.access_token && r.data.refresh_token) {
+      self._saveToken(r.data);
+      return;
+    }
+    gopeed.logger.warn("[pikpak] refresh_token 刷新失败：" + authErrorText(r));
+    if (!self.username || !self.password) {
+      throw new Error(
+        "refresh_token 无效（" + authErrorText(r) + "），请重新获取后填写"
+      );
+    }
+    return self.signin();
+  });
+};
+
+// 有凭据时确保持有可用的 access_token；返回是否处于登录状态
+PikPakClient.prototype.ensureLogin = function () {
+  if (!this.hasCredentials()) {
+    return Promise.resolve(false);
+  }
+  // 设置里粘贴了新的 refresh_token：以它为准（刷新后会轮换，新值存在 storage 里）
+  if (
+    this.refreshTokenSetting &&
+    this.refreshTokenSetting !== storageGet("seed_refresh_token")
+  ) {
+    var seed = this.refreshTokenSetting;
+    this._clearToken();
+    this.refreshToken = seed;
+    // 成功后才记下，失败时下次仍会重试这个值并给出真实原因
+    return this.refreshAccessToken().then(function () {
+      storageSet("seed_refresh_token", seed);
+      return true;
+    });
+  }
+  // 换了账号：旧 token 作废
+  if (storageGet("account") !== this.username) {
+    this._clearToken();
+  } else {
+    this.accessToken = storageGet("access_token");
+    this.refreshToken = storageGet("refresh_token");
+    this.userId = storageGet("user_id");
+  }
+  var expiresAt = parseInt(storageGet("expires_at"), 10) || 0;
+  var p;
+  if (this.accessToken && new Date().getTime() < expiresAt) {
+    p = Promise.resolve();
+  } else if (this.refreshToken) {
+    p = this.refreshAccessToken();
+  } else {
+    p = this.signin();
+  }
+  return p.then(function () {
+    return true;
+  });
+};
+
+// 验证码失效 / access_token 过期时自动刷新后重试（最多重试 2 次）
+PikPakClient.prototype._request = function (path, method, query, body) {
   var self = this;
   var url = "https://" + this.apiHost + path;
   if (query) {
     var q = buildQuery(query);
     if (q) url += (url.indexOf("?") >= 0 ? "&" : "?") + q;
   }
-  var doCall = function () {
-    return httpJson({ url: url, method: method, headers: self._headers() });
-  };
   var action = method.toUpperCase() + ":" + path;
-  var ensure = self.captchaToken
-    ? Promise.resolve()
-    : self.refreshCaptcha(action);
-  return ensure
-    .then(doCall)
-    .then(function (r) {
-      if (r.data && r.data.error_code === 9) {
-        // 验证码失效，重刷一次
-        return self.refreshCaptcha(action).then(doCall);
-      }
-      return r;
-    })
+  var attempt = 0;
+  var doCall = function () {
+    attempt++;
+    var ensure = self.captchaToken
+      ? Promise.resolve()
+      : self.refreshCaptcha(action);
+    return ensure
+      .then(function () {
+        return httpJson({
+          url: url,
+          method: method,
+          headers: self._headers(),
+          body: body ? JSON.stringify(body) : undefined,
+        });
+      })
+      .then(function (r) {
+        var code = r.data && r.data.error_code;
+        if (attempt > 2) return r;
+        if (code === 9) {
+          // 验证码失效
+          return self.refreshCaptcha(action).then(doCall);
+        }
+        if ((code === 16 || code === 4121 || code === 4122) && self.refreshToken) {
+          // access_token 过期
+          return self.refreshAccessToken().then(doCall);
+        }
+        return r;
+      });
+  };
+  return doCall()
     .then(function (r) {
       if (!r.data) {
-        throw new Error("PikPak 接口返回非 JSON：" + r.status + " " + r.text);
+        throw new Error("接口返回非 JSON：" + r.status + " " + r.text);
       }
       if (r.data.error_code) {
         throw new Error(
-          "PikPak 接口错误 " +
+          "接口错误 " +
             r.data.error_code +
             "：" +
             (r.data.error_description || r.data.error || r.text)
@@ -368,9 +591,159 @@ PikPakClient.prototype.getFileInfo = function (shareId, fileId) {
   });
 };
 
+// ====== 转存：PikPak 对非视频文件只提供"存到自己网盘再下载"（网页端的下载按钮也只是引导转存） ======
+function sleep(ms) {
+  return new Promise(function (resolve) {
+    setTimeout(resolve, ms);
+  });
+}
+
+// trace_file_ids 是 JSON：{分享内文件 ID: 自己网盘里的文件 ID}
+function parseTraceIds(s) {
+  try {
+    return (s && JSON.parse(s)) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+PikPakClient.prototype.waitTask = function (taskId) {
+  var self = this;
+  var tries = 0;
+  function poll() {
+    tries++;
+    return sleep(1000)
+      .then(function () {
+        return self._request("/drive/v1/tasks/" + taskId, "GET");
+      })
+      .then(function (task) {
+        var params = task.params || {};
+        if (task.phase === "PHASE_TYPE_ERROR" || params.error_detail) {
+          throw new Error(
+            "转存失败：" + (task.message || params.error_detail || task.phase)
+          );
+        }
+        if (task.phase === "PHASE_TYPE_COMPLETE") {
+          return params.trace_file_ids;
+        }
+        if (tries >= 60) {
+          throw new Error("转存超时（任务 " + taskId + "）");
+        }
+        return poll();
+      });
+  }
+  return poll();
+};
+
+// 返回 {分享内文件 ID: 自己网盘里的文件 ID}；ancestorIds 是文件所在目录在分享内的路径
+PikPakClient.prototype.restore = function (shareId, fileIds, ancestorIds) {
+  var self = this;
+  var body = {
+    share_id: shareId,
+    pass_code_token: this.passCodeToken || "",
+    file_ids: fileIds,
+    params: { trace_file_ids: fileIds.join(",") },
+  };
+  if (ancestorIds && ancestorIds.length) {
+    body.ancestor_ids = ancestorIds;
+  }
+  return this._request("/drive/v1/share/restore", "POST", null, body).then(
+    function (resp) {
+      if (resp.restore_status === "RESTORE_COMPLETE") {
+        return parseTraceIds(resp.params && resp.params.trace_file_ids);
+      }
+      if (!resp.restore_task_id) {
+        throw new Error("转存失败：" + JSON.stringify(resp).slice(0, 200));
+      }
+      return self.waitTask(resp.restore_task_id).then(parseTraceIds);
+    }
+  );
+};
+
+PikPakClient.prototype.getOwnFile = function (fileId) {
+  return this._request("/drive/v1/files/" + fileId, "GET", {
+    _magic: "2021",
+    usage: "FETCH",
+    thumbnail_size: "SIZE_LARGE",
+  });
+};
+
+// 转存过的文件记在 storage 里，重复解析同一分享时直接复用，不再占用每日转存次数
+function restoreCacheKey(shareId, fileId) {
+  return "restored:" + shareId + ":" + fileId;
+}
+
+function resolveByRestore(client, shareId, items) {
+  // 1) 先试缓存
+  var pending = [];
+  return items
+    .reduce(function (p, item) {
+      return p.then(function () {
+        var ownId = storageGet(restoreCacheKey(shareId, item.id));
+        if (!ownId) {
+          pending.push(item);
+          return;
+        }
+        return client
+          .getOwnFile(ownId)
+          .then(function (fi) {
+            item.url = fi.trashed ? "" : pickDownloadUrl(fi, client.useTrans);
+          })
+          .catch(function () {
+            item.url = "";
+          })
+          .then(function () {
+            if (!item.url) pending.push(item);
+          });
+      });
+    }, Promise.resolve())
+    .then(function () {
+      // 2) 其余的按所在目录分组转存（同目录一次请求）
+      var groups = {};
+      var order = [];
+      for (var i = 0; i < pending.length; i++) {
+        var key = pending[i].ancestors.join(",");
+        if (!groups[key]) {
+          groups[key] = [];
+          order.push(key);
+        }
+        groups[key].push(pending[i]);
+      }
+      return order.reduce(function (p, key) {
+        return p.then(function () {
+          var group = groups[key];
+          var ids = group.map(function (it) {
+            return it.id;
+          });
+          gopeed.logger.info("[pikpak] restoring", ids.length, "files to own drive");
+          return client
+            .restore(shareId, ids, group[0].ancestors)
+            .then(function (trace) {
+              return group.reduce(function (p2, item) {
+                return p2.then(function () {
+                  var ownId = trace[item.id];
+                  if (!ownId) return;
+                  storageSet(restoreCacheKey(shareId, item.id), ownId);
+                  return client.getOwnFile(ownId).then(function (fi) {
+                    item.url = pickDownloadUrl(fi, client.useTrans);
+                  });
+                });
+              }, Promise.resolve());
+            })
+            .catch(function (e) {
+              // 一组失败（如每日转存次数用完）不影响其他文件，原因留给最终报错
+              client.restoreError = (e && e.message) || String(e);
+              gopeed.logger.warn("[pikpak] restore failed:", client.restoreError);
+            });
+        });
+      }, Promise.resolve());
+    });
+}
+
 // ====== 业务逻辑 ======
-function listAllFiles(client, shareId, parentId, pathPrefix) {
-  // 递归列出所有文件，返回 [{name, path, size, id}]
+function listAllFiles(client, shareId, parentId, pathPrefix, ancestors) {
+  // 递归列出所有文件，返回 [{name, path, size, id, ancestors}]
+  ancestors = ancestors || [];
   var out = [];
   var pageToken = "";
   var page = 0;
@@ -407,6 +780,7 @@ function listAllFiles(client, shareId, parentId, pathPrefix) {
               name: f.name,
               path: pathPrefix,
               size: parseInt(f.size, 10) || 0,
+              ancestors: ancestors,
             });
           }
         }
@@ -419,11 +793,15 @@ function listAllFiles(client, shareId, parentId, pathPrefix) {
               var sub = pathPrefix
                 ? pathPrefix + "/" + t.folder.name
                 : t.folder.name;
-              return listAllFiles(client, shareId, t.folder.id, sub).then(
-                function (childFiles) {
-                  out = out.concat(childFiles);
-                }
-              );
+              return listAllFiles(
+                client,
+                shareId,
+                t.folder.id,
+                sub,
+                ancestors.concat([t.folder.id])
+              ).then(function (childFiles) {
+                out = out.concat(childFiles);
+              });
             });
           }, Promise.resolve());
         });
@@ -448,29 +826,43 @@ function pickDownloadUrl(fileInfo, useTrans) {
   return "";
 }
 
+function describeNames(names) {
+  var shown = names.slice(0, 3).join("、");
+  return names.length > 3 ? shown + " 等 " + names.length + " 个文件" : shown;
+}
+
+// 只有 MessageError 会被 Gopeed 展示给用户；普通 Error 或空结果都会让 Gopeed
+// 退回成把分享页当普通 HTTP 下载，解析出一个"未知文件"
+var UserError = typeof MessageError !== "undefined" ? MessageError : Error;
+
 gopeed.events.onResolve(function (ctx) {
   var settings = gopeed.settings || {};
-  var parsed = parseShareUrl(ctx.req.url);
   var client = new PikPakClient(settings);
+  var parsed;
+  var loggedIn = false;
 
-  gopeed.logger.info(
-    "[pikpak] resolve shareId=" + parsed.shareId,
-    "initialParentId=" + (parsed.initialParentId || "(none)")
-  );
-
-  // 1) pass_code_token 默认空：仅在有密码分享时用密码调 /drive/v1/share 换取
-  var passCodeTokenPromise;
-  if (settings.share_pwd) {
-    passCodeTokenPromise = client
-      .getShareInfo(parsed.shareId, settings.share_pwd)
-      .then(function (info) {
-        return info.pass_code_token || "";
-      });
-  } else {
-    passCodeTokenPromise = Promise.resolve("");
-  }
-
-  return passCodeTokenPromise
+  return Promise.resolve()
+    .then(function () {
+      parsed = parseShareUrl(ctx.req.url);
+      gopeed.logger.info(
+        "[pikpak] resolve shareId=" + parsed.shareId,
+        "initialParentId=" + (parsed.initialParentId || "(none)")
+      );
+      return client.ensureLogin();
+    })
+    .then(function (ok) {
+      loggedIn = ok;
+      gopeed.logger.info(
+        "[pikpak] mode=" + (loggedIn ? "login user_id=" + client.userId : "anonymous")
+      );
+      // 1) pass_code_token 默认空：仅在有密码分享时用密码调 /drive/v1/share 换取
+      if (!settings.share_pwd) return "";
+      return client
+        .getShareInfo(parsed.shareId, settings.share_pwd)
+        .then(function (info) {
+          return info.pass_code_token || "";
+        });
+    })
     .then(function (token) {
       client.passCodeToken = token;
       // 从根目录开始递归列；URL 里的 initialParentId 仅是 UI 跳转参数，不影响列全部文件
@@ -481,36 +873,68 @@ gopeed.events.onResolve(function (ctx) {
         throw new Error("分享内未找到任何可下载的文件");
       }
       gopeed.logger.info("[pikpak] flat files:", files.length);
-      // 2) 逐个解析下载链
-      var resolved = [];
+      // 2) 逐个取分享内的下载链（匿名时只有视频有）
       return files
         .reduce(function (p, item) {
           return p.then(function () {
             return client.getFileInfo(parsed.shareId, item.id).then(function (info) {
               var fi = info.file_info || info;
-              var url = pickDownloadUrl(fi, client.useTrans);
-              if (!url) {
-                gopeed.logger.warn("[pikpak] no download url for", item.name);
-                return;
-              }
-              resolved.push({
-                name: item.name,
-                path: item.path || "",
-                size: item.size,
-                req: {
-                  url: url,
-                  extra: {
-                    header: {
-                      "User-Agent": DEFAULT_UA,
-                      Referer: "https://mypikpak.com/",
-                    },
-                  },
-                },
-              });
+              item.url = pickDownloadUrl(fi, client.useTrans);
             });
           });
         }, Promise.resolve())
         .then(function () {
+          // 3) 剩下的（zip 等）登录后转存到自己网盘再取下载链
+          var noUrl = files.filter(function (it) {
+            return !it.url;
+          });
+          if (!noUrl.length || !loggedIn) return;
+          return resolveByRestore(client, parsed.shareId, noUrl);
+        })
+        .then(function () {
+          var resolved = [];
+          var missing = [];
+          for (var i = 0; i < files.length; i++) {
+            var item = files[i];
+            if (!item.url) {
+              gopeed.logger.warn("[pikpak] no download url for", item.name);
+              missing.push(item.name);
+              continue;
+            }
+            resolved.push({
+              name: item.name,
+              path: item.path || "",
+              size: item.size,
+              req: {
+                url: item.url,
+                extra: {
+                  header: {
+                    "User-Agent": DEFAULT_UA,
+                    Referer: "https://mypikpak.com/",
+                  },
+                },
+              },
+            });
+          }
+          if (!resolved.length) {
+            throw new Error(
+              loggedIn
+                ? "已登录，但未能拿到下载地址：" +
+                    describeNames(missing) +
+                    (client.restoreError ? "（" + client.restoreError + "）" : "")
+                : "匿名访问只提供视频的播放地址，" +
+                    describeNames(missing) +
+                    " 需要登录后才能下载。请在扩展设置中填写 PikPak 账号密码或 refresh_token"
+            );
+          }
+          if (missing.length) {
+            gopeed.logger.warn(
+              "[pikpak] skipped",
+              missing.length,
+              "files without download url" +
+                (loggedIn ? "" : " (configure login to download them)")
+            );
+          }
           ctx.res = {
             name: "",
             files: resolved,
@@ -525,5 +949,8 @@ gopeed.events.onResolve(function (ctx) {
             "files"
           );
         });
+    })
+    .catch(function (e) {
+      throw new UserError("PikPak: " + ((e && e.message) || String(e)));
     });
 });
