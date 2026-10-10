@@ -935,8 +935,10 @@ gopeed.events.onResolve(function (ctx) {
                 (loggedIn ? "" : " (configure login to download them)")
             );
           }
+          // Gopeed v1.9.x 要求 name 非空（否则报 invalid resource name 并退回 HTTP 解析）；
+          // 单文件时 name 不参与保存路径，用文件名即可
           ctx.res = {
-            name: "",
+            name: resolved[0].name,
             files: resolved,
           };
           if (resolved.length > 1) {

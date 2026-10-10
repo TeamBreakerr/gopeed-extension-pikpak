@@ -75,6 +75,19 @@ var ctx = { req: { url: url } };
 Promise.resolve(handler(ctx)).then(
   function () {
     var res = ctx.res;
+    // 与 Gopeed v1.9.x 的 Resource.Validate 一致，不通过时 Gopeed 会退回 HTTP 解析
+    var invalid = !res || !res.name
+      ? "invalid resource name"
+      : !res.files.length
+        ? "invalid resource files"
+        : res.files.some(function (f) { return !f.name; })
+          ? "invalid resource file name"
+          : "";
+    if (invalid) {
+      console.log("\nFAIL Gopeed would reject the result: " + invalid);
+      process.exitCode = 1;
+      return;
+    }
     console.log("\nOK name=" + JSON.stringify(res.name), "files=" + res.files.length);
     res.files.forEach(function (f) {
       console.log(
