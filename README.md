@@ -7,6 +7,10 @@
 > - 转存会占用你的网盘空间；免费账号每天的转存次数有限
 > - 同一分享里转存过的文件会记住，重复解析不会再次转存（除非你把网盘里那份删了）
 
+> **先选文件，再取链接（v1.2.0）。** 解析时只列出文件名和大小，勾选列表在 Gopeed 界面的 60 秒超时之前出现；
+> 开始下载时才为**勾选的文件**取直链，登录时也只把**勾选的文件**转存到网盘，没勾选的文件不占网盘空间和转存次数。
+> 创建任务时请保持“直接下载”不勾选，才能看到勾选列表。
+
 ## 功能
 
 - 识别 `mypikpak.com` / `mypikpak.net` 上的分享链接
@@ -43,6 +47,8 @@ gopeed://install/https%3A%2F%2Fgithub.com%2FTeamBreakerr%2Fgopeed-extension-pikp
 ```bash
 node test/cli.js https://mypikpak.com/s/<share_id>
 ```
+
+离线单元测试（不联网）：`node --test tests/resolve.test.cjs`
 
 ## 设置项
 

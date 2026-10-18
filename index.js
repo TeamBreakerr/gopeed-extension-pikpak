@@ -237,23 +237,71 @@ function parseShareUrl(rawUrl) {
 }
 
 // ====== HTTP 客户端封装 ======
-function httpJson(opts) {
-  // opts: { url, method, headers, body }
-  return fetch(opts.url, {
-    method: opts.method || "GET",
-    headers: opts.headers || {},
-    body: opts.body || undefined,
-  }).then(function (resp) {
-    return resp.text().then(function (text) {
+var REQUEST_TIMEOUT_MS = 30000;
+var REQUEST_ATTEMPTS = 5;
+
+function waitForRetry(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+function requestJsonOnce(opts) {
+  // Gopeed's fetch hides transport errors and offers no request timeout option.
+  // Its XMLHttpRequest implementation supports a real HTTP client timeout.
+  return new Promise(function (resolve, reject) {
+    var xhr = new XMLHttpRequest();
+    xhr.open(opts.method || "GET", opts.url);
+    xhr.timeout = REQUEST_TIMEOUT_MS;
+    var headers = opts.headers || {};
+    for (var key in headers) xhr.setRequestHeader(key, headers[key]);
+    xhr.onload = function () {
+      var text = xhr.responseText || "";
       var data = null;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch (e) {
-        // 非 JSON
-      }
-      return { status: resp.status, ok: resp.ok, text: text, data: data };
-    });
+      try { data = text ? JSON.parse(text) : null; } catch (e) { /* non-JSON */ }
+      resolve({
+        status: xhr.status,
+        ok: xhr.status >= 200 && xhr.status < 300,
+        text: text,
+        data: data,
+        retryAfter: xhr.getResponseHeader("Retry-After"),
+      });
+    };
+    xhr.onerror = function () { reject(new Error("network connection failed")); };
+    xhr.ontimeout = function () { reject(new Error("request timed out (30s)")); };
+    xhr.onabort = function () { reject(new Error("request aborted")); };
+    xhr.send(opts.body || null);
   });
+}
+
+function httpJson(opts) {
+  // Never log queries, passwords, captcha tokens or signed download URLs.
+  var endpoint = (opts.method || "GET") + " " + opts.url.split("?")[0];
+  function attempt(number) {
+    return requestJsonOnce(opts).then(function (r) {
+      if (r.status === 408 || r.status === 429 || r.status >= 500) {
+        return retry(number, "HTTP " + r.status, r.retryAfter);
+      }
+      return r;
+    }, function () {
+      return retry(number, "network error or timeout", null);
+    });
+  }
+  function retry(number, reason, retryAfter) {
+    if (number >= REQUEST_ATTEMPTS) {
+      throw new Error(endpoint + " failed after " + number + " attempts: " + reason);
+    }
+    var delay = Math.pow(2, number - 1) * 1000;
+    if (retryAfter) {
+      var seconds = Number(retryAfter);
+      var requested = isNaN(seconds) ? Date.parse(retryAfter) - Date.now() : seconds * 1000;
+      // Do not retry earlier than the server requests, or wait indefinitely.
+      if (requested > 60000) throw new Error(endpoint + " rate limited; try again later");
+      if (requested > delay) delay = requested;
+    }
+    gopeed.logger.warn("[pikpak] retry " + number + "/" + (REQUEST_ATTEMPTS - 1) +
+      " " + endpoint + " " + reason + " wait=" + delay + "ms");
+    return waitForRetry(delay).then(function () { return attempt(number + 1); });
+  }
+  return attempt(1);
 }
 
 function PikPakClient(settings) {
@@ -826,20 +874,21 @@ function pickDownloadUrl(fileInfo, useTrans) {
   return "";
 }
 
-function describeNames(names) {
-  var shown = names.slice(0, 3).join("、");
-  return names.length > 3 ? shown + " 等 " + names.length + " 个文件" : shown;
-}
-
 // 只有 MessageError 会被 Gopeed 展示给用户；普通 Error 或空结果都会让 Gopeed
 // 退回成把分享页当普通 HTTP 下载，解析出一个"未知文件"
 var UserError = typeof MessageError !== "undefined" ? MessageError : Error;
+
+// Two-stage flow (based on TeamBreakerr/gopeed-extension-pikpak PR #1 by learnr-reader):
+// onResolve only lists the share (names, sizes) so the selection list appears before the
+// desktop/web UI's 60 s timeout. onStart then gets a link for each *selected* file only,
+// and when logged in saves only that file to the user's drive if PikPak gives no direct link.
+// A reserved, nonresolving domain keeps an unresolved task from downloading the share page.
+var PENDING_URL = "https://pikpak-pending.invalid/file";
 
 gopeed.events.onResolve(function (ctx) {
   var settings = gopeed.settings || {};
   var client = new PikPakClient(settings);
   var parsed;
-  var loggedIn = false;
 
   return Promise.resolve()
     .then(function () {
@@ -850,12 +899,11 @@ gopeed.events.onResolve(function (ctx) {
       );
       return client.ensureLogin();
     })
-    .then(function (ok) {
-      loggedIn = ok;
+    .then(function (loggedIn) {
       gopeed.logger.info(
         "[pikpak] mode=" + (loggedIn ? "login user_id=" + client.userId : "anonymous")
       );
-      // 1) pass_code_token 默认空：仅在有密码分享时用密码调 /drive/v1/share 换取
+      // pass_code_token 默认空：仅在有密码分享时用密码调 /drive/v1/share 换取
       if (!settings.share_pwd) return "";
       return client
         .getShareInfo(parsed.shareId, settings.share_pwd)
@@ -872,87 +920,96 @@ gopeed.events.onResolve(function (ctx) {
       if (!files.length) {
         throw new Error("分享内未找到任何可下载的文件");
       }
-      gopeed.logger.info("[pikpak] flat files:", files.length);
-      // 2) 逐个取分享内的下载链（匿名时只有视频有）
-      return files
-        .reduce(function (p, item) {
-          return p.then(function () {
-            return client.getFileInfo(parsed.shareId, item.id).then(function (info) {
-              var fi = info.file_info || info;
-              item.url = pickDownloadUrl(fi, client.useTrans);
-            });
-          });
-        }, Promise.resolve())
-        .then(function () {
-          // 3) 剩下的（zip 等）登录后转存到自己网盘再取下载链
-          var noUrl = files.filter(function (it) {
-            return !it.url;
-          });
-          if (!noUrl.length || !loggedIn) return;
-          return resolveByRestore(client, parsed.shareId, noUrl);
-        })
-        .then(function () {
-          var resolved = [];
-          var missing = [];
-          for (var i = 0; i < files.length; i++) {
-            var item = files[i];
-            if (!item.url) {
-              gopeed.logger.warn("[pikpak] no download url for", item.name);
-              missing.push(item.name);
-              continue;
-            }
-            resolved.push({
-              name: item.name,
-              path: item.path || "",
-              size: item.size,
-              req: {
-                url: item.url,
-                extra: {
-                  header: {
-                    "User-Agent": DEFAULT_UA,
-                    Referer: "https://mypikpak.com/",
-                  },
-                },
+      // Gopeed v1.9.x 要求 name 非空（否则报 invalid resource name 并退回 HTTP 解析）；
+      // 单文件时 name 不参与保存路径，用文件名即可；多文件时用分享 ID 末尾作目录名
+      ctx.res = {
+        name: files.length > 1 ? "PikPak-" + parsed.shareId.slice(-10) : files[0].name,
+        files: files.map(function (item) {
+          return {
+            name: item.name,
+            path: item.path || "",
+            size: item.size,
+            req: {
+              url: PENDING_URL,
+              labels: {
+                "pikpak-share-file": "1",
+                "pikpak-share-id": parsed.shareId,
+                "pikpak-file-id": item.id,
+                "pikpak-ancestors": item.ancestors.join(","),
               },
-            });
-          }
-          if (!resolved.length) {
-            throw new Error(
-              loggedIn
-                ? "已登录，但未能拿到下载地址：" +
-                    describeNames(missing) +
-                    (client.restoreError ? "（" + client.restoreError + "）" : "")
-                : "匿名访问只提供视频的播放地址，" +
-                    describeNames(missing) +
-                    " 需要登录后才能下载。请在扩展设置中填写 PikPak 账号密码或 refresh_token"
-            );
-          }
-          if (missing.length) {
-            gopeed.logger.warn(
-              "[pikpak] skipped",
-              missing.length,
-              "files without download url" +
-                (loggedIn ? "" : " (configure login to download them)")
-            );
-          }
-          // Gopeed v1.9.x 要求 name 非空（否则报 invalid resource name 并退回 HTTP 解析）；
-          // 单文件时 name 不参与保存路径，用文件名即可
-          ctx.res = {
-            name: resolved[0].name,
-            files: resolved,
+            },
           };
-          if (resolved.length > 1) {
-            // 多文件时给出一个目录名（取分享 ID 末尾若干）
-            ctx.res.name = "PikPak-" + parsed.shareId.slice(-10);
-          }
-          gopeed.logger.info(
-            "[pikpak] resolved",
-            resolved.length,
-            "files"
-          );
-        });
+        }),
+      };
+      gopeed.logger.info(
+        "[pikpak] listed " + files.length + " files; links deferred until start"
+      );
     })
     .catch(function (e) {
       throw new UserError("PikPak: " + ((e && e.message) || String(e)));
+    });
+});
+
+gopeed.events.onStart(function (ctx) {
+  var req = ctx.task.meta.req;
+  var labels = req.labels || {};
+  if (labels["pikpak-share-file"] !== "1") return;
+  // Also drop an old signed link on resume. Gopeed 1.9.3 logs onStart errors but still
+  // starts the task, so on any failure the task fails on PENDING_URL instead.
+  req.url = PENDING_URL;
+  var settings = gopeed.settings || {};
+  var client = new PikPakClient(settings);
+  var shareId = labels["pikpak-share-id"];
+  var item = {
+    id: labels["pikpak-file-id"],
+    name: (ctx.task.meta.res && ctx.task.meta.res.name) || labels["pikpak-file-id"],
+    ancestors: labels["pikpak-ancestors"] ? labels["pikpak-ancestors"].split(",") : [],
+    url: "",
+  };
+  var loggedIn = false;
+
+  return Promise.resolve()
+    .then(function () {
+      if (!shareId || !item.id) throw new Error("缺少分享或文件标识，请重新创建任务");
+      return client.ensureLogin();
+    })
+    .then(function (ok) {
+      loggedIn = ok;
+      if (!settings.share_pwd) return;
+      return client.getShareInfo(shareId, settings.share_pwd).then(function (info) {
+        client.passCodeToken = info.pass_code_token || "";
+      });
+    })
+    .then(function () {
+      // 先试分享内的直链（匿名时只有视频有），再试已转存过的缓存
+      return client.getFileInfo(shareId, item.id).then(function (info) {
+        item.url = pickDownloadUrl(info.file_info || info, client.useTrans);
+      });
+    })
+    .then(function () {
+      if (item.url || !loggedIn) return;
+      // 只转存这一个被选中的文件
+      return resolveByRestore(client, shareId, [item]);
+    })
+    .then(function () {
+      if (!item.url || !/^https?:\/\//i.test(item.url)) {
+        throw new Error(
+          loggedIn
+            ? "已登录，但未能拿到下载地址" +
+                (client.restoreError ? "（" + client.restoreError + "）" : "")
+            : "匿名访问只提供视频的下载地址，其他文件请在扩展设置中填写 PikPak 账号密码或 refresh_token"
+        );
+      }
+      req.extra = req.extra || {};
+      req.extra.header = req.extra.header || {};
+      req.extra.header["User-Agent"] = DEFAULT_UA;
+      req.extra.header.Referer = "https://mypikpak.com/";
+      req.url = item.url;
+      gopeed.logger.info("[pikpak] download URL ready for file " + item.id);
+    })
+    .catch(function (e) {
+      var message = "PikPak 下载地址解析失败：" + ((e && e.message) || String(e));
+      gopeed.logger.error("[pikpak] " + message);
+      throw new UserError(message);
     });
 });
